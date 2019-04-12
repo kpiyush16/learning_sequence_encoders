@@ -10,82 +10,81 @@ import os
 from torch.autograd import Variable
 from sklearn.metrics.pairwise import pairwise_distances
 import warnings
-import calendar
-
-def JulianDate_to_MMDDYYY(y,jd):
-    month = 1
-    day = 0
-    while jd - calendar.monthrange(y,month)[1] > 0 and month <= 12:
-        jd = jd - calendar.monthrange(y,month)[1]
-        month = month + 1
-    d = jd
-    if jd//10 == 0:
-        d = '0'+str(jd)
-    return ([x+'y' for x in list(str(y))] +[str(month)+'m' if month//10==1 else '0'+str(month)+'m'] 
-            +[x+'d' for x in list(str(d))])
-
-def get_batch(data_lst, bs, ptr):
-    h, r, t = [], [], []
-    for x in data_lst[ptr:bs+ptr]:
-        h.append(x[0])
-        # r.append(x[1])
-        r.append([x[1]]+[vocab_r[i] for i in JulianDate_to_MMDDYYY(2014,x[3]//24+1)])
-        t.append(x[2])
-    return (h, r, t)
-
-# Returns a negative batch with either head or tail corruption for entire batch
-def get_nbatch(data_lst, bs, ptr):
-    triples = [[],[],[]]
-    for x in data_lst[ptr:bs+ptr]:
-        triples[0].append(x[0])
-        triples[1].append([x[1]]+[vocab_r[i] for i in JulianDate_to_MMDDYYY(2014,x[3]//24+1)])
-        # triples[1].append(x[1])
-        triples[2].append(x[2])
-    np.random.shuffle(triples[np.random.randint(2)*2])
-    return(triples[0], triples[1], triples[2])
-
-class Triple(object):
-	def __init__(self, head, tail, relation):
-		self.h = head
-		self.t = tail
-		self.r = relation
-
-def loadTriple(inPath, fileName, test_data=None):
-    tripleList = []
-    if test_data is not None:
-        for x in test_data:
-            head = x[0]
-            tail = x[2]
-            rel = [x[1]]+[vocab_r[i] for i in JulianDate_to_MMDDYYY(2014,x[3]//24+1)]
-            tripleList.append(Triple(head, tail, rel))
-    else:
-        with open(os.path.join(inPath, fileName), 'r') as fr:
-            for line in fr:
-                x = list(map(int, line.strip().split("\t")))
-                head = x[0]
-                tail = x[2]
-                rel = [x[1]]+[vocab_r[i] for i in JulianDate_to_MMDDYYY(2014,x[3]//24+1)]
-                tripleList.append(Triple(head, tail, rel))
-
-    # tripleDict = {}
-    # for triple in tripleList:
-    #     tripleDict[(triple.h, triple.t, triple.r)] = True
-
-    return len(tripleList), tripleList
+from data_generate import *
+from utils import *
 
 class Config(object):
     def __init__(self):
-        self.train_model = "TA_TransE"
+        self.train_model = "DistMult"
+        self.save_path = "./saved_res1/"
         self.testFlag = True
+        self.save_epoch = 10
         self.hidden_size = 100
         self.nbatches = 0
         self.batch_size = 512
         self.entity_nums = 0
         self.relation_nums = 0
-        self.trainTimes = 501
+        self.trainTimes = 201
         self.margin = 1.0
-        self.lmbda = 0
+        self.lmbda = 0.01
         self.lr = 1e-3
+        self.p_norm = 2
+        self.vocab = True
+        self.valid_epoch = 201
+        self.dropout = 0.4
+        self.criterion = "MRandSoftPlus" # "CE" or "MRandSoftPlus"
+        self.load = "./saved_res1/DistMult_200.pt"
+
+class TransE(nn.Module):
+    def __init__(self, config):
+        super(TransE, self).__init__()
+        self.config = config
+        self.entity_embeddings = nn.Embedding(config.entity_nums, config.hidden_size)
+        self.relation_embeddings = nn.Embedding(config.relation_nums, config.hidden_size)
+        if self.config.criterion == "CE":
+            self.criterion = nn.BCEWithLogitsLoss(size_average=True, reduce=True).cuda()
+        elif self.config.criterion == "MRandSoftPlus":
+            self.criterion = nn.MarginRankingLoss(self.config.margin, False).cuda()
+        else:
+            print("Enter correct criterion");exit(0)
+        self.init_weights()
+
+    def init_weights(self):
+        nn.init.xavier_uniform(self.entity_embeddings.weight.data)
+        nn.init.xavier_uniform(self.relation_embeddings.weight.data)
+    
+    def loss_calc(self, pos, neg):
+        if self.config.criterion == "CE":
+            y = torch.tensor([1]*len(pos)+[0]*len(neg)).cuda().float()
+            return self.criterion(torch.cat((pos, neg)).float(), y)
+        else:
+            y = Variable(torch.Tensor([-1.0]).cuda())
+            return self.criterion(pos, neg, y)
+
+    def _calc(self, h, r, t):
+        return torch.norm(h + r - t, self.config.p_norm, -1)
+
+    def forward(self, pos_h, pos_r, pos_t, neg_h, neg_r, neg_t):
+        pos_h_e = self.entity_embeddings(pos_h)
+        pos_r_e = self.relation_embeddings(pos_r[:,0])
+        pos_t_e = self.entity_embeddings(pos_t)
+        
+        neg_h_e = self.entity_embeddings(neg_h)
+        neg_r_e = self.relation_embeddings(neg_r[:,0])
+        neg_t_e = self.entity_embeddings(neg_t)
+
+        p_score = self._calc(pos_h_e, pos_r_e, pos_t_e)
+        n_score = self._calc(neg_h_e, neg_r_e, neg_t_e)
+        
+        return self.loss_calc(p_score, n_score)
+
+    def predict(self, h, r, t):
+        ph_e = self.entity_embeddings(h)
+        pt_e = self.entity_embeddings(t)
+        pr_e = self.relation_embeddings(r[:,0])
+        # pr_e = self.relation_embeddings(Variable(torch.from_numpy(r)))
+        # predict = torch.sum(torch.abs(ph_e + pr_e - pt_e), 1)
+        return (ph_e, pr_e, pt_e)
 
 class TA_TransE(nn.Module):
     def __init__(self, config):
@@ -93,8 +92,14 @@ class TA_TransE(nn.Module):
         self.config = config
         self.entity_embeddings = nn.Embedding(config.entity_nums, config.hidden_size)
         self.relation_embeddings = nn.Embedding(config.relation_nums, config.hidden_size)
-        self.lstm = nn.LSTM(config.hidden_size, config.hidden_size, batch_first=True)
+        self.lstm = nn.LSTM(config.hidden_size, config.hidden_size, batch_first=True, dropout=self.config.dropout)
         self.hidden = self.init_hidden()
+        if self.config.criterion == "CE":
+            self.criterion = nn.BCEWithLogitsLoss(size_average=True, reduce=True).cuda()
+        elif self.config.criterion == "MRandSoftPlus":
+            self.criterion = nn.MarginRankingLoss(self.config.margin, False).cuda()
+        else:
+            print("Enter correct criterion");exit(0)
         self.init_weights()
         
     def init_hidden(self):
@@ -104,48 +109,89 @@ class TA_TransE(nn.Module):
     def init_weights(self):
         nn.init.xavier_uniform(self.entity_embeddings.weight.data)
         nn.init.xavier_uniform(self.relation_embeddings.weight.data)
-        F.normalize(self.entity_embeddings.weight.data, p = 2)
-        F.normalize(self.relation_embeddings.weight.data, p = 2)
     
-    def loss_calc(self, pos, neg):
-        criterion = nn.MarginRankingLoss(self.config.margin, False).cuda()
-        y = Variable(torch.Tensor([-1])).cuda()
-        return criterion(pos, neg, y)
+    def _calc(self, h, r, t):
+        return torch.norm(h + r - t, self.config.p_norm, -1)
 
-        # criterion = nn.CrossEntropyLoss().cuda()
-        # y = Variable(torch.Tensor([0, 1])).cuda()
-        # return criterion(torch.Tensor([neg, pos]).cuda())
+    def loss_calc(self, pos, neg):
+        if self.config.criterion == "CE":
+            y = torch.tensor([1]*len(pos)+[0]*len(neg)).cuda().float()
+            return self.criterion(torch.cat((pos, neg)).float(), y)
+        else:
+            y = Variable(torch.Tensor([-1.0]).cuda())
+            return self.criterion(pos, neg, y)
+        
 
     def forward(self, pos_h, pos_r, pos_t, neg_h, neg_r, neg_t):
         pos_h_e = self.entity_embeddings(pos_h)
-        temp = self.relation_embeddings(pos_r)
-        out, _ = self.lstm(temp, self.hidden)
-        pos_r_e = out[:, -1, :]
+        # pos_r_e = self.lstm(self.relation_embeddings(pos_r), self.hidden)[0][:, -1, :]
+        pos_r_e = self.lstm(self.relation_embeddings(pos_r))[1][0][0]
         pos_t_e = self.entity_embeddings(pos_t)
         
         neg_h_e = self.entity_embeddings(neg_h)
-        temp1 = self.relation_embeddings(neg_r)
-        out1, _ = self.lstm(temp1, self.hidden)
-        neg_r_e = out1[:, -1, :]
+        # neg_r_e = self.lstm(self.relation_embeddings(neg_r), self.hidden)[0][:, -1, :]
+        neg_r_e = self.lstm(self.relation_embeddings(neg_r))[1][0][0]
         neg_t_e = self.entity_embeddings(neg_t)
 
-        p_score = torch.abs(pos_h_e + pos_r_e - pos_t_e)
-        n_score = torch.abs(neg_h_e + neg_r_e - neg_t_e)
-        p_score = p_score.view(-1, 1, 100)
-        n_score = n_score.view(-1, 1, 100)
-
-        pos = torch.sum(torch.mean(p_score, 1), 1)
-        neg = torch.sum(torch.mean(n_score, 1), 1)
-
-        return self.loss_calc(pos, neg)
+        p_score = self._calc(pos_h_e, pos_r_e, pos_t_e)
+        n_score = self._calc(neg_h_e, neg_r_e, neg_t_e)
+        
+        return self.loss_calc(p_score, n_score)
 
     def predict(self, h, r, t):
         ph_e = self.entity_embeddings(h)
         pt_e = self.entity_embeddings(t)
-        pr_e = self.lstm(self.relation_embeddings(r))[0][:,-1,:]
+        # pr_e = self.lstm(self.relation_embeddings(r))[0][:,-1,:]
+        pr_e = self.lstm(self.relation_embeddings(r))[1][0][0]
         # pr_e = self.relation_embeddings(Variable(torch.from_numpy(r)))
         # predict = torch.sum(torch.abs(ph_e + pr_e - pt_e), 1)
         return (ph_e, pr_e, pt_e)
+
+class DistMult(nn.Module):
+    def __init__(self, config):
+        super(DistMult, self).__init__()
+        self.config = config
+        self.entity_embeddings = nn.Embedding(config.entity_nums, config.hidden_size)
+        self.relation_embeddings = nn.Embedding(config.relation_nums, config.hidden_size)
+        if self.config.criterion == "CE":
+            self.criterion = nn.BCEWithLogitsLoss(size_average=True, reduce=True).cuda()
+        elif self.config.criterion == "MRandSoftPlus":
+            self.criterion=nn.Softplus().cuda()
+        else:
+            print("Enter correct criterion");exit(0)        
+        self.init_weights()
+
+    def init_weights(self):
+        nn.init.xavier_uniform(self.entity_embeddings.weight.data)
+        nn.init.xavier_uniform(self.relation_embeddings.weight.data)
+    
+    def _calc(self, h, t, r):
+        return - torch.sum(h * t * r, -1)
+
+    def loss(self, score, regul, batch_y):
+        if self.config.criterion == "CE":
+            # return torch.mean(self.criterion(score, batch_y)) + self.config.lmbda * regul
+            return self.criterion(score, batch_y)
+        else:
+            return torch.mean(self.criterion(score * batch_y)) + self.config.lmbda * regul 
+    
+    def forward(self, pos_h, pos_r, pos_t, neg_h, neg_r, neg_t):
+        h, r, t = torch.cat((pos_h, neg_h)), torch.cat((pos_r, neg_r)), torch.cat((pos_t, neg_t))
+        batch_y = torch.Tensor([1]*len(pos_h)+[-1]*len(neg_h)).cuda()
+        h, t = self.entity_embeddings(h), self.entity_embeddings(t)
+        r = self.relation_embeddings(r[:,0])
+        score = self._calc(h ,t, r)
+        regul = torch.mean(h ** 2) + torch.mean(t ** 2) + torch.mean(r ** 2)
+        return self.loss(score, regul, batch_y)
+    
+    def predict(self, h, r, t):
+        # p_e_h=self.entity_embeddings(Variable(torch.from_numpy(predict_h)))
+        p_e_h=self.entity_embeddings(h)
+        p_e_t=self.entity_embeddings(t)
+        p_e_r = self.relation_embeddings(r[:,0])
+        # p_e_r=self.relation_embeddings(Variable(torch.from_numpy(predict_r)))
+        # p_score=-self.loss_calc(p_e_h,p_e_t,p_e_r)
+        return (p_e_h, p_e_r, p_e_t)
 
 class TA_DistMult(nn.Module):
     def __init__(self, config):
@@ -153,8 +199,14 @@ class TA_DistMult(nn.Module):
         self.config = config
         self.entity_embeddings = nn.Embedding(config.entity_nums, config.hidden_size)
         self.relation_embeddings = nn.Embedding(config.relation_nums, config.hidden_size)
-        self.lstm = nn.LSTM(config.hidden_size, config.hidden_size, batch_first=True)
-        self.softplus=nn.Softplus().cuda()
+        self.lstm = nn.LSTM(config.hidden_size, config.hidden_size, batch_first=True, dropout=self.config.dropout)
+        
+        if self.config.criterion == "CE":
+            self.criterion = nn.BCEWithLogitsLoss(size_average=True, reduce=True).cuda()
+        elif self.config.criterion == "MRandSoftPlus":
+            self.criterion=nn.Softplus().cuda()
+        else:
+            print("Enter correct criterion");exit(0)
         self.hidden = self.init_hidden()
         self.init_weights()
         
@@ -165,130 +217,166 @@ class TA_DistMult(nn.Module):
     def init_weights(self):
         nn.init.xavier_uniform(self.entity_embeddings.weight.data)
         nn.init.xavier_uniform(self.relation_embeddings.weight.data)
-        F.normalize(self.entity_embeddings.weight.data, p = 2)
-        F.normalize(self.relation_embeddings.weight.data, p = 2)
     
-    def loss_calc(self,h,t,r):
-        return torch.sum(h*t*r,1,False)
-    
-    def loss_func(self,loss,regul):
-        return loss+self.config.lmbda*regul
+    def _calc(self, h, t, r):
+        return - torch.sum(h * t * r, -1)
+
+    def loss(self, score, regul, batch_y):
+        if self.config.criterion == "CE":
+            # return torch.mean(self.criterion(score, batch_y)) + self.config.lmbda * regul
+            return self.criterion(score, batch_y)
+        else:
+            return torch.mean(self.criterion(score * batch_y)) + self.config.lmbda * regul 
     
     def forward(self, pos_h, pos_r, pos_t, neg_h, neg_r, neg_t):
         h, r, t = torch.cat((pos_h, neg_h)), torch.cat((pos_r, neg_r)), torch.cat((pos_t, neg_t))
-        y = torch.Tensor([1]*len(pos_h)+[-1]*len(neg_h)).cuda()
-        e_h, e_t = self.entity_embeddings(h), self.entity_embeddings(t)
-        temp = self.relation_embeddings(r)
-        out,_ = self.lstm(temp)
-        e_r = out[:,-1,:]
-        res = self.loss_calc(e_h,e_t,e_r)
-        tmp = self.softplus(- y*res)
-        loss = torch.mean(tmp)
-        regul = torch.mean(e_h ** 2) + torch.mean(e_t ** 2) + torch.mean(e_r ** 2)
-        loss = self.loss_func(loss,regul)
-        return loss
-    
-    def predict(self, predict_h, predict_t, predict_r):
-        p_e_h=self.entity_embeddings(Variable(torch.from_numpy(predict_h)))
-        p_e_t=self.entity_embeddings(Variable(torch.from_numpy(predict_t)))
-        p_e_r = self.lstm(self.relation_embeddings(r))[0][:,-1,:]
-        # p_e_r=self.relation_embeddings(Variable(torch.from_numpy(predict_r)))
-        p_score=-self.loss_calc(p_e_h,p_e_t,p_e_r)
-        return p_score.cpu().data.numpy()	
+        batch_y = torch.tensor([1]*len(pos_h)+[-1]*len(neg_h)).cuda().float()
 
-def evaluation_transE(model, entity_embeddings, testList, L1_flag=False, bs = 500):
-    totalRank, hit10Count, tripleCount = 0, 0, 0
+        h, t = self.entity_embeddings(h), self.entity_embeddings(t)
+        r = self.lstm(self.relation_embeddings(r))[1][0][0]
+        score = self._calc(h, t, r)
+
+        regul = torch.mean(h ** 2) + torch.mean(t ** 2) + torch.mean(r ** 2)
+        return self.loss(score, regul, batch_y)
+    
+    def predict(self, h, r, t):
+        p_e_h=self.entity_embeddings(h)
+        p_e_t=self.entity_embeddings(t)
+        p_e_r = self.lstm(self.relation_embeddings(r))[1][0][0]
+        return (p_e_h, p_e_r, p_e_t)
+
+def evaluation(model, entity_embeddings, testList, tripleDict, filter=True, L1_flag=False, bs = 500, cuda = False, res_file = None):
+    totalRank, hit10Count, tripleCount, reciRank = 0, 0, 0, 0
     print("Stating Test----------------->")
     print("Test Triple Count", len(testList))
-    print("Hits@10  Average Rank  Triples Processed")
+
     for i in range(0, len(testList), bs):
-        headList = torch.tensor([triple.h for triple in testList[i:i+bs]], dtype=torch.int64)
-        tailList = torch.tensor([triple.t for triple in testList[i:i+bs]], dtype=torch.int64)
-        relList = torch.tensor([triple.r for triple in testList[i:i+bs]], dtype=torch.int64)
+        model.eval()
+        if cuda:
+            headList = torch.tensor([triple.h for triple in testList[i:i+bs]], dtype=torch.int64).cuda()
+            tailList = torch.tensor([triple.t for triple in testList[i:i+bs]], dtype=torch.int64).cuda()
+            relList = torch.tensor([triple.r for triple in testList[i:i+bs]], dtype=torch.int64).cuda()
+        else:
+            headList = torch.tensor([triple.h for triple in testList[i:i+bs]], dtype=torch.int64)
+            tailList = torch.tensor([triple.t for triple in testList[i:i+bs]], dtype=torch.int64)
+            relList = torch.tensor([triple.r for triple in testList[i:i+bs]], dtype=torch.int64)
         h_e, r_e, t_e = model.predict(headList, relList, tailList)
-        c_t_e = h_e + r_e
-        c_h_e = t_e - r_e
+        if cuda:
+            h_e, r_e, t_e, headList, tailList = h_e.cpu().numpy(), r_e.cpu().numpy(), t_e.cpu().numpy(), headList.cpu().numpy(), tailList.cpu().numpy()
+        if("TransE" in model.config.train_model):
+            c_t_e = h_e + r_e
+            c_h_e = t_e - r_e
+            if L1_flag == True:
+                dist = pairwise_distances(c_t_e, entity_embeddings, metric='manhattan')
+            else:
+                dist = pairwise_distances(c_t_e, entity_embeddings, metric='euclidean')
 
-        if L1_flag == True:
-            dist = pairwise_distances(c_t_e, entity_embeddings, metric='manhattan')
+            rankArrayTail = np.argsort(dist, axis=1)
+            # print(type(tailList), type(rankArrayTail))
+            if filter == False:
+                rankListTail = np.array([int(np.argwhere(elem[1]==elem[0]))+1 for elem in zip(tailList, rankArrayTail)])
+            else:
+                rankListTail = np.array([argwhereTail(elem[0], elem[1], elem[2], elem[3], tripleDict)+1
+                                for elem in zip(headList, tailList, relList, rankArrayTail)])
+            
+            isHit10ListTail = [x for x in rankListTail if x < 10]
+
+            if L1_flag == True:
+                dist = pairwise_distances(c_h_e, entity_embeddings, metric='manhattan')
+            else:
+                dist = pairwise_distances(c_h_e, entity_embeddings, metric='euclidean')
+            
+            rankArrayHead = np.argsort(dist, axis=1)
+
+            if filter == False:
+                rankListHead = np.array([int(np.argwhere(elem[1]==elem[0]))+1 for elem in zip(headList, rankArrayHead)])
+            # Check whether it is false negative
+            else:
+                rankListHead = np.array([argwhereHead(elem[0], elem[1], elem[2], elem[3], tripleDict)+1
+							for elem in zip(headList, tailList, relList, rankArrayHead)])
+            
+            isHit10ListHead = [x for x in rankListHead if x < 10]
+
+            totalRank += float(sum(rankListTail) + sum(rankListHead))/2.0
+            hit10Count += (len(isHit10ListTail) + len(isHit10ListHead))/2
+            tripleCount += (len(rankListTail) + len(rankListHead))/2
+            reciRank += (0.5)*(sum(1/rankListHead)+sum(1/rankListTail))
+            print(totalRank/(i+bs), hit10Count*100/(i+bs), reciRank/(i+bs))
         else:
-            dist = pairwise_distances(c_t_e, entity_embeddings, metric='euclidean')
+            rankListHead, rankListTail = [], []
+            score = -np.sum(h_e * t_e * r_e, 1)
+            score_list_tail = np.transpose([-np.sum(h_e * x * r_e, 1) for x in entity_embeddings])
+            score_list_head = np.transpose([-np.sum(x * t_e * r_e, 1) for x in entity_embeddings])
+            for i in range(len(score)):
+                for j in range(len(score_list_tail[i])):
+                    if(score_list_tail[i][j] == score[i]):
+                        rankListTail.append(np.where(np.argsort(score_list_tail[i]) == j)[0] + 1)
 
-        rankArrayTail = np.argsort(dist, axis=1)
-        rankListTail = [int(np.argwhere(elem[1]==elem[0])) for elem in zip(tailList, rankArrayTail)]
-        isHit10ListTail = [x for x in rankListTail if x < 10]
+            for i in range(len(score)):
+                for j in range(len(score_list_head[i])):
+                    if(score_list_head[i][j] == score[i]):
+                        rankListHead.append(np.where(np.argsort(score_list_head[i]) == j)[0] + 1)
+            isHit10ListTail = [x for x in rankListTail if x < 10]
+            isHit10ListHead = [x for x in rankListHead if x < 10]
+            # print(rankListHead)
+            totalRank += float(sum(rankListTail) + sum(rankListHead))/2.0
+            hit10Count += (len(isHit10ListTail) + len(isHit10ListHead))/2
+            tripleCount += (len(rankListTail) + len(rankListHead))/2
+            reciRank += (0.5)*(sum(1/np.array(rankListHead))+sum(1/np.array(rankListTail)))
+        
+    print("Hits@10, MR, MRR")
+    s = "{:.0f}, {:.1f}, {:.4f}".format(float(hit10Count)*100/len(testList), float(totalRank)/len(testList), float(reciRank)/float(len(testList)))
+    print(s)
+    if(res_file):
+        with open(res_file, "a") as f:
+            f.write(s+"\n")
 
-        if L1_flag == True:
-            dist = pairwise_distances(c_h_e, entity_embeddings, metric='manhattan')
-        else:
-            dist = pairwise_distances(c_h_e, entity_embeddings, metric='euclidean')
-        rankArrayHead = np.argsort(dist, axis=1)
-        rankListHead = [int(np.argwhere(elem[1]==elem[0])) for elem in zip(headList, rankArrayHead)]
-        # print(rankArrayHead)
-        # print(rankListHead)
-        # break
-        isHit10ListHead = [x for x in rankListHead if x < 10]
-
-        totalRank += (sum(rankListTail) + sum(rankListHead))/2
-        hit10Count += (len(isHit10ListTail) + len(isHit10ListHead))/2
-        tripleCount += (len(rankListTail) + len(rankListHead))/2
-        if(i%100 == 0):
-            print("{:.6f}, {:.6f}, {:.0f}".format(hit10Count*100/(i+bs), totalRank/(i+bs), tripleCount))
-
-    print((hit10Count, totalRank, tripleCount))
-    return hit10Count, totalRank, tripleCount
-
-
-with open("icews/combined.txt", "r") as f1:
-    data = [list(map(int, line.strip().split("\t")[:-1])) for line in f1.readlines()]
-    
-
-    lst = ([str(x)+'y' for x in range(10)]+[str(x)+'m' if len(str(x))==2 else '0'+str(x)+'m' for x in range(1,13)]
-        +[str(x)+'d' for x in range(10)])
-    vocab_, vocab_r = set([x[1] for x in data]), {}
-    for i in lst:
-        vocab_r[i] = len(vocab_r)
-    for i in vocab_:
-        vocab_r[str(i)] = len(vocab_r)
-    np.random.shuffle(data)
-    ent_nums = len(set([x[0] for x in data]+[x[2] for x in data]))
-    rel_nums = len(vocab_r)
-    with open("./icews/train_mod.txt", "r") as f2, open("./icews/test_mod.txt", "r") as f3:
-        data = [list(map(int, line.strip().split("\t"))) for line in f2.readlines()]
-        test_data = [list(map(int, line.strip().split("\t"))) for line in f3.readlines()]
-
-
-warnings.filterwarnings("ignore")
-print("CUDA Available: ", torch.cuda.is_available())
 
 def test():
     config = Config()
-    config.relation_nums = rel_nums
-    config.entity_nums = ent_nums
-    print("Total number of Entities:", config.entity_nums)
-    print("Total number of Relations:", config.relation_nums-32)
+    te_set, vocab_e, vocab_r = test_data_prepare("./TemporalKGs/icews05-15/icews_2005-2015_test.txt", vocab_e_path="ent.vocab", vocab_r_path="rel.vocab")
+    t_set, v_set, _, _ = data_prepare("./TemporalKGs/icews05-15/icews_2005-2015_train.txt", "./TemporalKGs/icews05-15/icews_2005-2015_valid.txt", config.vocab)
+    _, _, tripleDict = loadTriple(test_data=t_set+v_set+te_set)
+    config.relation_nums = len(vocab_r)
+    config.entity_nums = len(vocab_e)
 
     print("Evaluating %s"%(config.train_model))
-    testTotal, testList = loadTriple('./icews/', 'test_mod.txt')
+    testTotal, testList, _ = loadTriple(test_data=te_set)
 
-    train_model = TA_TransE(config)
-    ckpt = torch.load("./icews/TA_TransE_495.pt")
-    train_model.load_state_dict(ckpt['model_state_dict'])
-    train_model.eval()
+    print("Total number of triples: ", testTotal)
+    print("Total number of Entities:", config.entity_nums)
+    print("Total number of Relations:", config.relation_nums-32)
+    device = torch.device("cuda")
+    if(config.train_model == "TA_DistMult"):
+        model = TA_DistMult(config).to(device)
+    elif(config.train_model == "TA_TransE"):
+        model = TA_TransE(config).to(device)
+    elif(config.train_model == "TransE"):
+        model = TransE(config).to(device)
+    elif(config.train_model == "DistMult"):
+        model = DistMult(config).to(device)
+    else:
+        print("Please Enter Valid Model Name");exit(1)
+
+    ckpt = torch.load(config.load)
+    print("Loaded ckpt from %s"%(config.load))
+    model.load_state_dict(ckpt['model_state_dict'])
+    model.eval()
     with torch.no_grad():
-        evaluation_transE(train_model, train_model.entity_embeddings.weight.data.cpu().numpy(), testList)
+        evaluation(model, model.entity_embeddings.weight.data.cpu().numpy(), testList, tripleDict, cuda=True, res_file="results_%s.log"%(config.train_model))
 
     return
 
 def train():
     config = Config()
-    config.relation_nums = rel_nums
-    config.entity_nums = ent_nums
-    print("Total number of triples: ",len(data))
+    t_set, v_set, vocab_e, vocab_r = data_prepare("./TemporalKGs/icews05-15/icews_2005-2015_train.txt", "./TemporalKGs/icews05-15/icews_2005-2015_valid.txt", vocab = config.vocab)
+    _, _, tripleDict = loadTriple(test_data=t_set+v_set)
+    config.relation_nums = len(vocab_r)
+    config.entity_nums = len(vocab_e)
+    print("Total number of triples: ",len(t_set+v_set))
     print("Total number of Entities:", config.entity_nums)
     print("Total number of Relations:", config.relation_nums-32)
-    sz = int(0.1*(len(data)))
-    t_set, v_set = data[:-sz], data[-sz:]
+
     if(config.nbatches):
         config.batch_size = len(t_set) // config.nbatches
     else:
@@ -300,13 +388,19 @@ def train():
         model = TA_DistMult(config).to(device)
     elif(config.train_model == "TA_TransE"):
         model = TA_TransE(config).to(device)
+    elif(config.train_model == "TransE"):
+        model = TransE(config).to(device)
+    elif(config.train_model == "DistMult"):
+        model = DistMult(config).to(device)
     else:
         print("Please Enter Valid Model Name");exit(1)
     # optimizer = optim.SGD(model.parameters(), lr=1e-2)
     optimizer = optim.Adam(model.parameters(), lr=config.lr, weight_decay=1e-5)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=3, verbose=True)
 
-    print("Starting Train ----------->")
+    print("Starting Train %s----------->"%(config.train_model))
+    log = open("train_%s.log"%(config.train_model), "a")
+    log.flush()
     for epoch in range(config.trainTimes):
         model.train()
         train_loss = 0
@@ -328,7 +422,9 @@ def train():
             # if(bn%100 == 0): print("Steps completed: ", bn)
 
         test_loss = 0
-        for bn in range(sz//config.batch_size):
+        sz = len(v_set)
+        v_nbatches = sz//config.batch_size
+        for bn in range(v_nbatches):
             vph, vpr, vpt = tuple(get_batch(v_set, config.batch_size, bn*config.batch_size))
             vnh, vnr, vnt = tuple(get_nbatch(v_set, config.batch_size, bn*config.batch_size))
             hp = torch.tensor(vph, dtype=torch.int64).cuda()
@@ -342,14 +438,27 @@ def train():
             test_loss = test_loss + loss
 
         scheduler.step(train_loss)
-        print('Epoch:{:.0f}\t Train_loss:{:.2f}\t Valid_loss:{:.2f}\t Avg train_loss:{:.6f}\tAvg valid_loss:{:.6f}'.format(epoch,(train_loss),(test_loss),(train_loss/len(t_set)),(test_loss/len(v_set))))
-        if(epoch%5 == 0):
+
+        if(epoch%config.save_epoch == 0 and epoch):
             torch.save({'epoch':epoch,
             'model_state_dict':model.state_dict(),
             'optimizer_state_dict':optimizer.state_dict(),
-            'loss':train_loss, 'batch_size':config.batch_size}, os.path.join("./icews/",'{}_{}.pt'.format(config.train_model, epoch)))
+            'loss':train_loss, 'batch_size':config.batch_size}, os.path.join(config.save_path,'{}_{}.pt'.format(config.train_model, epoch)))
+        
+        lin = 'Epoch:{:.0f}\t Train_loss:{:.2f}\t Valid_loss:{:.2f}\t Avg train_loss:{:.6f}\tAvg valid_loss:{:.6f}'.format(epoch,(train_loss),(test_loss),(train_loss/config.nbatches),(test_loss/v_nbatches))
+        print(lin)
+        log.write(lin+"\n")
+        if(epoch%config.valid_epoch == 0 and epoch):
+            testTotal, testList, _ = loadTriple(test_data=v_set)
+            with torch.no_grad():
+                evaluation(model, model.entity_embeddings.weight.data.cpu().numpy(), testList, tripleDict, cuda=True, res_file="results_%s.log"%(config.train_model))
+        
+    log.close()
+    return
 
-    # print(model.state_dict())
 
-# train()
-test()
+if __name__ == "__main__":
+    warnings.filterwarnings("ignore")
+    print("CUDA Available: ", torch.cuda.is_available())
+    train()
+    test()

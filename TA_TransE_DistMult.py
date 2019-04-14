@@ -1,5 +1,3 @@
-# coding: utf-8
-# In[1]:
 import torch
 import torch.autograd as autograd
 import torch.nn as nn
@@ -11,29 +9,32 @@ from torch.autograd import Variable
 from sklearn.metrics.pairwise import pairwise_distances
 import warnings
 from data_generate import *
+from wikidata_generate import *
 from utils import *
 
 class Config(object):
     def __init__(self):
-        self.train_model = "DistMult"
-        self.save_path = "./saved_res1/"
+        self.dataset = "icews14" # "wikidata" or "icews14" or "icews05-15" 
+        self.train_model = "TA_TransE" # Model to run
+        self.save_path = "./saved_res_icews14/" # Path in which checkpoints will be saved
         self.testFlag = True
         self.save_epoch = 10
-        self.hidden_size = 100
+        self.hidden_size = 100 # Hidden dimension size
         self.nbatches = 0
-        self.batch_size = 512
+        self.batch_size = 512 
         self.entity_nums = 0
         self.relation_nums = 0
-        self.trainTimes = 201
+        self.trainTimes = 201 # Number of epochs to be trained
         self.margin = 1.0
-        self.lmbda = 0.01
+        self.lmbda = 0.01 # Regularization Parameter
         self.lr = 1e-3
-        self.p_norm = 2
-        self.vocab = True
-        self.valid_epoch = 201
+        self.p_norm = 2 # Norm taken for TransE
+        # Vocabs are already made and are in the respective result folders for all the datasets.
+        self.vocab = True # False if vocab is not present
+        self.valid_epoch = 20 # Number of epochs for results to be validated
         self.dropout = 0.4
         self.criterion = "MRandSoftPlus" # "CE" or "MRandSoftPlus"
-        self.load = "./saved_res1/DistMult_200.pt"
+        self.load = self.save_path+"TA_TransE_200.pt" # Load from the ckpt during testing
 
 class TransE(nn.Module):
     def __init__(self, config):
@@ -115,8 +116,8 @@ class TA_TransE(nn.Module):
 
     def loss_calc(self, pos, neg):
         if self.config.criterion == "CE":
-            y = torch.tensor([1]*len(pos)+[0]*len(neg)).cuda().float()
-            return self.criterion(torch.cat((pos, neg)).float(), y)
+            y = torch.tensor([1]*len(pos)+[-1]*len(neg)).cuda().float()
+            return self.criterion(torch.cat((pos, neg)).float(), Variable(y))
         else:
             y = Variable(torch.Tensor([-1.0]).cuda())
             return self.criterion(pos, neg, y)
@@ -249,7 +250,7 @@ def evaluation(model, entity_embeddings, testList, tripleDict, filter=True, L1_f
     totalRank, hit10Count, tripleCount, reciRank = 0, 0, 0, 0
     print("Stating Test----------------->")
     print("Test Triple Count", len(testList))
-
+    print("Showing Intermediate results for MR, Hits@10 and MRR...")
     for i in range(0, len(testList), bs):
         model.eval()
         if cuda:
@@ -307,15 +308,32 @@ def evaluation(model, entity_embeddings, testList, tripleDict, filter=True, L1_f
             score = -np.sum(h_e * t_e * r_e, 1)
             score_list_tail = np.transpose([-np.sum(h_e * x * r_e, 1) for x in entity_embeddings])
             score_list_head = np.transpose([-np.sum(x * t_e * r_e, 1) for x in entity_embeddings])
-            for i in range(len(score)):
-                for j in range(len(score_list_tail[i])):
-                    if(score_list_tail[i][j] == score[i]):
-                        rankListTail.append(np.where(np.argsort(score_list_tail[i]) == j)[0] + 1)
+            rankArrayTail = np.argsort(score_list_tail, axis=1)
+            rankArrayHead = np.argsort(score_list_head, axis=1)
 
-            for i in range(len(score)):
-                for j in range(len(score_list_head[i])):
-                    if(score_list_head[i][j] == score[i]):
-                        rankListHead.append(np.where(np.argsort(score_list_head[i]) == j)[0] + 1)
+            # for i in range(len(score)):
+            #     for j in range(len(score_list_tail[i])):
+            #         if(score_list_tail[i][j] == score[i]):
+            #             rankListTail.append(np.where(np.argsort(score_list_tail[i]) == j)[0] + 1)
+
+            # for i in range(len(score)):
+            #     for j in range(len(score_list_head[i])):
+            #         if(score_list_head[i][j] == score[i]):
+            #             rankListHead.append(np.where(np.argsort(score_list_head[i]) == j)[0] + 1)
+
+            if filter == False:
+                rankListTail = np.array([int(np.argwhere(elem[1]==elem[0]))+1 for elem in zip(tailList, rankArrayTail)])
+            else:
+                rankListTail = np.array([argwhereTail(elem[0], elem[1], elem[2], elem[3], tripleDict)+1
+                                for elem in zip(headList, tailList, relList, rankArrayTail)])
+
+            if filter == False:
+                rankListHead = np.array([int(np.argwhere(elem[1]==elem[0]))+1 for elem in zip(headList, rankArrayHead)])
+            # Check whether it is false negative
+            else:
+                rankListHead = np.array([argwhereHead(elem[0], elem[1], elem[2], elem[3], tripleDict)+1
+							for elem in zip(headList, tailList, relList, rankArrayHead)])
+            
             isHit10ListTail = [x for x in rankListTail if x < 10]
             isHit10ListHead = [x for x in rankListHead if x < 10]
             # print(rankListHead)
@@ -323,6 +341,7 @@ def evaluation(model, entity_embeddings, testList, tripleDict, filter=True, L1_f
             hit10Count += (len(isHit10ListTail) + len(isHit10ListHead))/2
             tripleCount += (len(rankListTail) + len(rankListHead))/2
             reciRank += (0.5)*(sum(1/np.array(rankListHead))+sum(1/np.array(rankListTail)))
+            print(totalRank/(i+bs), hit10Count*100/(i+bs), reciRank/(i+bs))
         
     print("Hits@10, MR, MRR")
     s = "{:.0f}, {:.1f}, {:.4f}".format(float(hit10Count)*100/len(testList), float(totalRank)/len(testList), float(reciRank)/float(len(testList)))
@@ -334,8 +353,15 @@ def evaluation(model, entity_embeddings, testList, tripleDict, filter=True, L1_f
 
 def test():
     config = Config()
-    te_set, vocab_e, vocab_r = test_data_prepare("./TemporalKGs/icews05-15/icews_2005-2015_test.txt", vocab_e_path="ent.vocab", vocab_r_path="rel.vocab")
-    t_set, v_set, _, _ = data_prepare("./TemporalKGs/icews05-15/icews_2005-2015_train.txt", "./TemporalKGs/icews05-15/icews_2005-2015_valid.txt", config.vocab)
+    if config.dataset == "icews14":
+        te_set, vocab_e, vocab_r = test_data_prepare("./TemporalKGs/icews14/icews_2014_test.txt", vocab_e_path=config.save_path+"ent.vocab", vocab_r_path=config.save_path+"rel.vocab")
+        t_set, v_set, _, _ = data_prepare("./TemporalKGs/icews14/icews_2014_train.txt", "./TemporalKGs/icews14/icews_2014_valid.txt", vocab_e_path=config.save_path+"ent.vocab", vocab_r_path=config.save_path+"rel.vocab")
+    elif config.dataset == "icews05-15":
+        te_set, vocab_e, vocab_r = test_data_prepare("./TemporalKGs/icews05-15/icews_2005-2015_test.txt", vocab_e_path=config.save_path+"ent.vocab", vocab_r_path=config.save_path+"rel.vocab")
+        t_set, v_set, _, _ = data_prepare("./TemporalKGs/icews05-15/icews_2005-2015_train.txt", "./TemporalKGs/icews05-15/icews_2005-2015_valid.txt", vocab_e_path=config.save_path+"ent.vocab", vocab_r_path=config.save_path+"rel.vocab")
+    else:
+        te_set, vocab_e, vocab_r = test_wikidata_prepare("./TemporalKGs/wikidata/wiki_test.txt", vocab_e_path=config.save_path+"ent.vocab", vocab_r_path=config.save_path+"rel.vocab")
+        t_set, v_set, _, _ = wikidata_prepare("./TemporalKGs/wikidata/wiki_train.txt", "./TemporalKGs/wikidata/wiki_valid.txt", vocab_e_path=config.save_path+"ent.vocab", vocab_r_path=config.save_path+"rel.vocab")
     _, _, tripleDict = loadTriple(test_data=t_set+v_set+te_set)
     config.relation_nums = len(vocab_r)
     config.entity_nums = len(vocab_e)
@@ -369,7 +395,13 @@ def test():
 
 def train():
     config = Config()
-    t_set, v_set, vocab_e, vocab_r = data_prepare("./TemporalKGs/icews05-15/icews_2005-2015_train.txt", "./TemporalKGs/icews05-15/icews_2005-2015_valid.txt", vocab = config.vocab)
+    if config.dataset == "icews14":
+        t_set, v_set, vocab_e, vocab_r = data_prepare("./TemporalKGs/icews14/icews_2014_train.txt", "./TemporalKGs/icews14/icews_2014_valid.txt", vocab = config.vocab, vocab_e_path=config.save_path+"ent.vocab", vocab_r_path=config.save_path+"rel.vocab")
+    elif config.dataset == "icews05-15":
+        t_set, v_set, vocab_e, vocab_r = data_prepare("./TemporalKGs/icews05-15/icews_2005-2015_train.txt", "./TemporalKGs/icews05-15/icews_2005-2015_valid.txt", vocab = config.vocab, vocab_e_path=config.save_path+"ent.vocab", vocab_r_path=config.save_path+"rel.vocab")
+    else:
+        t_set, v_set, vocab_e, vocab_r = wikidata_prepare("./TemporalKGs/wikidata/wiki_train.txt", "./TemporalKGs/wikidata/wiki_valid.txt", vocab = config.vocab, vocab_e_path=config.save_path+"ent.vocab", vocab_r_path=config.save_path+"rel.vocab")
+ 
     _, _, tripleDict = loadTriple(test_data=t_set+v_set)
     config.relation_nums = len(vocab_r)
     config.entity_nums = len(vocab_e)
@@ -455,7 +487,6 @@ def train():
         
     log.close()
     return
-
 
 if __name__ == "__main__":
     warnings.filterwarnings("ignore")
